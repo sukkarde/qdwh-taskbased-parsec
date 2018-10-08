@@ -1,0 +1,1012 @@
+extern "C" %{
+/*
+ * Copyright (c) 2010-2016 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation. All rights
+ *                         reserved.
+ * Copyright (c) 2013      Inria. All rights reserved.
+ * $COPYRIGHT
+ *
+ *
+ * @precisions normal z -> s d c
+ *
+ */
+#include <data_dist/matrix/matrix.h>
+#include <dague/private_mempool.h>
+#include <lapacke.h>
+#include <core_blas.h>
+
+#if defined(DAGUE_HAVE_RECURSIVE)
+#include <data_dist/matrix/subtile.h>
+#include <dague/recursive.h>
+#endif
+
+#if defined(DAGUE_HAVE_CUDA)
+#include <cores/dplasma_zcores.h>
+#endif  /* defined(DAGUE_HAVE_CUDA) */
+
+%}
+
+dataA1  [type = "dague_ddesc_t *"]
+dataA2  [type = "dague_ddesc_t *"]
+dataT1  [type = "dague_ddesc_t *" aligned=dataA1]
+dataT2  [type = "dague_ddesc_t *" aligned=dataA2]
+dataQ1  [type = "dague_ddesc_t *"]
+dataQ2  [type = "dague_ddesc_t *"]
+optqr   [type = "int"]
+optid   [type = "int"]
+p_work  [type = "dague_memory_pool_t *" size = "(sizeof(dague_complex64_t)*ib*descT1.nb)"]
+p_tau   [type = "dague_memory_pool_t *" size = "(sizeof(dague_complex64_t)   *descT1.nb)"]
+
+descA1  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataA1)"]
+descA2  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataA2)"]
+descT1  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataT1)"]
+descT2  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataT2)"]
+descQ1  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataQ1)"]
+descQ2  [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataQ2)"]
+
+ib      [type = "int" hidden = on default = "descT1.mb"]
+KT      [type = "int" hidden = on default = "descA1.nt-1" ]
+smallnb [type = "int" hidden = on default = "descA1.nb" ]
+
+A1_in( m, n )
+  m = 0 .. descA1.mt-1
+  n = 0 .. descA1.nt-1
+
+:dataA1(m, n)
+
+READ A <- dataA1(m, n)
+    /* A1 is not yet factorized */
+       -> (!optqr) && ( m == 0 ) && ( n == 0 ) ? A  geqrf1_zgeqrt( 0 )
+       -> (!optqr) && ( m == 0 ) && ( n != 0 ) ? C  geqrf1_zunmqr( 0, n )
+       -> (!optqr) && ( m != 0 ) && ( n == 0 ) ? A2 geqrf1_ztsqrt( 0, m )
+       -> (!optqr) && ( m != 0 ) && ( n != 0 ) ? A2 geqrf1_ztsmqr( 0, m, n )
+
+    /* A1 is already factorized*/
+    /* Upper part goes to TPMQR on A2 */
+       -> (optqr)  && ( m == n ) ? A1 geqrf2_ztsqrt( m, 0 )                      [type = UPPER_TILE]
+       -> (optqr)  && ( m <  n ) ? A1 geqrf2_ztsmqr( m, 0, n )
+    /* Lower part goes to UNGQR on Q1 */
+       -> (optqr)  && ( m == n ) ? A  A1_in_typechange( m )
+       -> (optqr)  && ( m >  n ) ? V  ungqr1_ztsmqr( n, m, n .. (descQ1.nt-1))
+
+READ T <- dataT1(m, n)
+       -> (optqr)  && ( m == n ) ? T ungqr1_zunmqr( n,    n .. (descQ1.nt-1))    [type = LITTLE_T]
+       -> (optqr)  && ( m >  n ) ? T ungqr1_ztsmqr( n, m, n .. (descQ1.nt-1))    [type = LITTLE_T]
+
+BODY
+{
+    /* Nothing */
+}
+END
+
+A1_in_typechange( m )
+m = 0 .. (optqr ? descA1.mt-1 : -1 )
+
+:dataA1(m, m)
+
+READ A <- A A1_in(m, m)
+       -> A ungqr1_zunmqr( m, m .. (descQ1.nt-1))    [type = LOWER_TILE]
+
+BODY
+{
+    /* Nothing */
+}
+END
+
+A2_in( m, n )
+  m = 0    .. descA2.mt-1
+  nmin = (optid ? m : 0)
+  n = nmin .. descA2.nt-1
+
+:dataA2(m, n)
+
+RW   A <- dataA2(m, n)
+       -> ( n == nmin ) ? A2 geqrf2_ztsqrt( nmin, m )
+       -> ( n != nmin ) ? A2 geqrf2_ztsmqr( nmin, m, n )
+
+BODY
+{
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m - m * descA2.mb) : descA2.mb;
+    int tempnn = (n == (descA2.nt-1)) ? (descA2.n - n * descA2.nb) : descA2.nb;
+    int ldam = BLKLDD( descA2, m );
+
+    if (m == n) {
+        LAPACKE_zlaset_work(
+            LAPACK_COL_MAJOR, 'A', tempmm, tempnn,
+            0., 1., A, ldam );
+    } else {
+        LAPACKE_zlaset_work(
+            LAPACK_COL_MAJOR, 'A', tempmm, tempnn,
+            0., 0., A, ldam );
+    }
+}
+END
+
+geqrf1_zgeqrt_typechange(k)  [profile = off]
+  /* Execution space */
+  k = 0 .. inline_c %{ return optqr ? -1 : KT; %}
+
+  : dataA1(k,k)
+
+RW A <- A geqrf1_zgeqrt(k)
+     -> (k < (descA1.nt-1)) ? A geqrf1_zunmqr(k, (k+1)..(descA1.nt-1)) [type = LOWER_TILE]
+     -> A ungqr1_zunmqr(k, k .. (descQ1.nt-1))                         [type = LOWER_TILE]
+     -> dataA1(k, k)                                                   [type = LOWER_TILE]
+
+BODY
+{
+    /* Nothing */
+}
+END
+
+/**************************************************
+ *                    geqrf_zgeqrt                      *
+ **************************************************/
+geqrf1_zgeqrt(k)
+  /* Execution space */
+  k = 0 .. inline_c %{ return optqr ? -1 : KT; %}
+
+  : dataA1(k, k)
+
+  RW    A <- (0 == k) ? A A1_in(k, k) : A2 geqrf1_ztsmqr(k-1, k, k)
+          -> (k <  (descA1.mt-1)) ? A1 geqrf1_ztsqrt(k, k+1)              [type = UPPER_TILE]
+          -> (k == (descA1.mt-1)) ? A1 geqrf2_ztsqrt(k, 0)                [type = UPPER_TILE]
+          -> A geqrf1_zgeqrt_typechange(k)
+
+  RW    T <- dataT1(k, k)                                                 [type = LITTLE_T]
+          -> dataT1(k, k)                                                 [type = LITTLE_T]
+          -> (descA1.nt-1 > k) ? T geqrf1_zunmqr(k, (k+1)..(descA1.nt-1)) [type = LITTLE_T]
+          -> T ungqr1_zunmqr(k, k .. (descQ1.nt-1)) [type = LITTLE_T]
+
+  /* Priority */
+  ;(descA1.nt-k)*(descA1.nt-k)*(descA1.nt-k)
+
+BODY [type=RECURSIVE]
+{
+    int tempkm = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempkn = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+
+    if (tempkm > smallnb) {
+        subtile_desc_t *small_descA;
+        subtile_desc_t *small_descT;
+        dague_handle_t *dague_zgeqrt;
+
+        small_descA = subtile_desc_create( &(descA1), k, k,
+                                           dague_imin(descA1.mb, ldak), smallnb,
+                                           0, 0, tempkm, tempkn );
+        small_descT = subtile_desc_create( &(descT1), k, k,
+                                           ib, smallnb,
+                                           0, 0, ib, tempkn );
+
+        small_descA->mat = A;
+        small_descT->mat = T;
+
+        /* dague_object */
+        dague_zgeqrt = dplasma_zgeqrfr_geqrt_New( (tiled_matrix_desc_t *)small_descA,
+                                                  (tiled_matrix_desc_t *)small_descT,
+                                                  p_work );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_zgeqrt, dplasma_zgeqrfr_geqrt_Destruct,
+                             2, small_descA, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempkm = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempkn = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+
+#if !defined(DAGUE_DRY_RUN)
+
+    void *p_elem_A = dague_private_memory_pop( p_tau );
+    void *p_elem_B = dague_private_memory_pop( p_work );
+
+    CORE_zgeqrt(tempkm, tempkn, ib,
+                A /* dataA1(k,k) */, ldak,
+                T /* dataT1(k,k) */, descT1.mb,
+                p_elem_A, p_elem_B );
+
+    dague_private_memory_push( p_tau,  p_elem_A );
+    dague_private_memory_push( p_work, p_elem_B );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+
+/**************************************************
+ *                    geqrf_zunmqr                      *
+ **************************************************/
+geqrf1_zunmqr(k,n)
+  /* Execution space */
+  k = 0   .. inline_c %{ return optqr ? -1 : KT-1; %}
+  n = k+1 .. descA1.nt-1
+
+  : dataA1(k,n)
+
+  READ  A <- A geqrf1_zgeqrt_typechange(k)                        [type = LOWER_TILE]
+  READ  T <- T geqrf1_zgeqrt(k)                                   [type = LITTLE_T]
+  RW    C <- (k == 0) ? A A1_in(k, n) : A2 geqrf1_ztsmqr(k-1, k, n)
+          -> A1 geqrf1_ztsmqr(k, k+1, n)
+
+BODY [type=RECURSIVE]
+{
+    int tempkm = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempnn = (n == (descA1.nt-1)) ? (descA1.n - n * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+
+    if (tempkm > smallnb) {
+        subtile_desc_t *small_descA;
+        subtile_desc_t *small_descT;
+        subtile_desc_t *small_descC;
+        dague_handle_t *dague_zunmqr_panel;
+
+
+        small_descA = subtile_desc_create( &(descA1), k, k,
+                                           dague_imin(descA1.mb, ldak), smallnb,
+                                           0, 0, tempkm, tempkm );
+        small_descC = subtile_desc_create( &(descA1), k, n,
+                                           dague_imin(descA1.mb, ldak), smallnb,
+                                           0, 0, tempkm, tempnn );
+        small_descT = subtile_desc_create( &(descT1), k, k,
+                                           ib, smallnb,
+                                           0, 0, ib, tempkm );
+
+        small_descA->mat = A;
+        small_descC->mat = C;
+        small_descT->mat = T;
+
+        /* dague_object */
+        dague_zunmqr_panel = dplasma_zgeqrfr_unmqr_New( (tiled_matrix_desc_t *)small_descA,
+                                                        (tiled_matrix_desc_t *)small_descT,
+                                                        (tiled_matrix_desc_t *)small_descC,
+                                                        p_work );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_zunmqr_panel, dplasma_zgeqrfr_unmqr_Destruct,
+                             3, small_descA, small_descC, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempkm = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempnn = (n == (descA1.nt-1)) ? (descA1.n - n * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+
+#if !defined(DAGUE_DRY_RUN)
+
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_zunmqr(PlasmaLeft, PlasmaConjTrans,
+                tempkm, tempnn, tempkm, ib,
+                A /* dataA1(k,k) */, ldak,
+                T /* dataT1(k,k) */, descT1.mb,
+                C /* dataA1(k,n) */, ldak,
+                p_elem_A, descT1.nb );
+
+    dague_private_memory_push( p_work, p_elem_A );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+
+geqrf1_ztsqrt_out_A1(k) [profile = off]
+  k = 0 .. KT
+  mmax = inline_c %{ return optid ? k : descA2.mt-1; %}
+
+  : dataA1(k, k)
+
+  RW A1 <- A1 geqrf2_ztsqrt(k, mmax) [type = UPPER_TILE]
+        -> dataA1(k, k)              [type = UPPER_TILE]
+BODY
+{
+    /* nothing */
+}
+END
+
+/**************************************************
+ *                    geqrf_ztsqrt                *
+ **************************************************/
+geqrf1_ztsqrt(k,m)
+  /* Execution space */
+  k = 0   .. inline_c %{ return optqr ? -1 : KT; %}
+  m = k+1 .. descA1.mt-1
+
+  : dataA1(m, k)
+
+  RW   A1 <- ( m != (k+1)) ? A1 geqrf1_ztsqrt(k, m-1)              [type = UPPER_TILE]
+          <- ( m == (k+1)) ? A  geqrf1_zgeqrt(k)                   [type = UPPER_TILE]
+
+          -> ( m == (descA1.mt-1)) ? A1 geqrf2_ztsqrt(k, 0)        [type = UPPER_TILE]
+          -> ( m != (descA1.mt-1)) ? A1 geqrf1_ztsqrt(k, m+1)      [type = UPPER_TILE]
+
+  RW   A2 <- (k == 0) ? A A1_in(m,  k)
+          <- (k != 0) ? A2 geqrf1_ztsmqr(k-1, m, k)
+
+          -> dataA1(m, k)
+          -> (k < (descA1.nt-1)) ? V geqrf1_ztsmqr(k, m, (k+1)..(descA1.nt-1))
+          -> V ungqr1_ztsmqr(k, m, k .. (descQ1.nt-1))
+
+  RW   T  <- dataT1(m, k)                                                      [type = LITTLE_T]
+          -> dataT1(m, k)                                                      [type = LITTLE_T]
+          -> (k < (descA1.nt-1)) ? T geqrf1_ztsmqr(k, m, (k+1)..(descA1.nt-1)) [type = LITTLE_T]
+          -> T ungqr1_ztsmqr(k, m, k .. (descQ1.nt-1)) [type = LITTLE_T]
+
+    /* Priority */
+; (descA1.mt-k)*(descA1.mt-k)*(descA1.mt-k)
+
+BODY [type=RECURSIVE]
+{
+    int tempmm = (m == (descA1.mt-1)) ? (descA1.m - m * descA1.mb) : descA1.mb;
+    int tempkn = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA1, m );
+
+    if (tempmm > smallnb) {
+        subtile_desc_t *small_descA1;
+        subtile_desc_t *small_descA2;
+        subtile_desc_t *small_descT;
+        dague_handle_t *dague_ztsqrt;
+
+
+        small_descA1 = subtile_desc_create( &(descA1), k, k,
+                                            dague_imin(descA1.mb, ldak), smallnb,
+                                            0, 0, tempkn, tempkn );
+        small_descA2 = subtile_desc_create( &(descA1), m, k,
+                                            dague_imin(descA1.mb, ldam), smallnb,
+                                            0, 0, tempmm, tempkn );
+        small_descT  = subtile_desc_create( &(descT), m, k,
+                                            ib, smallnb,
+                                            0, 0, ib, tempkn );
+
+        small_descA1->mat = A1;
+        small_descA2->mat = A2;
+        small_descT->mat  = T;
+
+        /* dague_object */
+        dague_ztsqrt = dplasma_zgeqrfr_tsqrt_New((tiled_matrix_desc_t *)small_descA1,
+                                                 (tiled_matrix_desc_t *)small_descA2,
+                                                 (tiled_matrix_desc_t *)small_descT,
+                                                 p_work, p_tau );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_ztsqrt, dplasma_zgeqrfr_tsqrt_Destruct,
+                             3, small_descA1, small_descA2, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempmm = (m == (descA1.mt-1)) ? (descA1.m - m * descA1.mb) : descA1.mb;
+    int tempkn = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA1, m );
+
+#if !defined(DAGUE_DRY_RUN)
+
+    void *p_elem_A = dague_private_memory_pop( p_tau );
+    void *p_elem_B = dague_private_memory_pop( p_work );
+
+    CORE_ztsqrt(tempmm, tempkn, ib,
+                A1 /* dataA1(k,k) */, ldak,
+                A2 /* dataA1(m,k) */, ldam,
+                T  /* dataT1(m,k) */, descT1.mb,
+                p_elem_A, p_elem_B );
+
+    dague_private_memory_push( p_tau,  p_elem_A );
+    dague_private_memory_push( p_work, p_elem_B );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+geqrf2_ztsqrt(k,m)
+  /* Execution space */
+  k    = 0 .. KT
+  mmax = inline_c %{ return optid ? k : descA2.mt-1; %}
+  m    = 0 .. mmax
+
+  : dataA2(m, k)
+
+  RW   A1 <- ( m == 0 ) && ( optqr) ? A  A1_in(k, k)                                        [type = UPPER_TILE]
+          <- ( m == 0 ) && (!optqr) & (k == descA1.mt-1) ? A  geqrf1_zgeqrt(k)              [type = UPPER_TILE]
+          <- ( m == 0 ) && (!optqr) & (k != descA1.mt-1) ? A1 geqrf1_ztsqrt(k, descA1.mt-1) [type = UPPER_TILE]
+          <- ( m != 0 )             ? A1 geqrf2_ztsqrt(k, m-1)                              [type = UPPER_TILE]
+
+          -> ( m == mmax ) ? A1 geqrf1_ztsqrt_out_A1(k)                 [type = UPPER_TILE]
+          -> ( m != mmax ) ? A1 geqrf2_ztsqrt(k, m+1)                   [type = UPPER_TILE]
+
+  RW   A2 <- (!optid && (k == 0)) || ( optid && (k == m)) ? A A2_in(m, k)
+          <- A2 geqrf2_ztsmqr(k-1, m, k)
+
+          -> (k < (descA2.nt-1)) ? V geqrf2_ztsmqr(k, m, (k+1)..(descA2.nt-1))
+          -> V ungqr2_ztsmqr(k, m, k .. (descQ2.nt-1))
+          -> dataA2(m, k)
+
+  RW   T  <- dataT2(m, k)                                                      [type = LITTLE_T]
+          -> dataT2(m, k)                                                      [type = LITTLE_T]
+          -> (k < (descA2.nt-1)) ? T geqrf2_ztsmqr(k, m, (k+1)..(descA2.nt-1)) [type = LITTLE_T]
+          -> T ungqr2_ztsmqr(k, m, k .. (descQ2.nt-1)) [type = LITTLE_T]
+
+    /* Priority */
+; (descA1.mt-k)*(descA1.mt-k)*(descA1.mt-k)
+
+BODY [type=RECURSIVE]
+{
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m - m * descA2.mb) : descA2.mb;
+    int tempkn = (k == (descA2.nt-1)) ? (descA2.n - k * descA2.nb) : descA2.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA2, m );
+
+    if (tempmm > smallnb) {
+        subtile_desc_t *small_descA1;
+        subtile_desc_t *small_descA2;
+        subtile_desc_t *small_descT;
+        dague_handle_t *dague_ztsqrt;
+
+
+        small_descA1 = subtile_desc_create( &(descA1), k, k,
+                                            dague_imin(descA1.mb, ldak), smallnb,
+                                            0, 0, tempkn, tempkn );
+        small_descA2 = subtile_desc_create( &(descA2), m, k,
+                                            dague_imin(descA2.mb, ldam), smallnb,
+                                            0, 0, tempmm, tempkn );
+        small_descT  = subtile_desc_create( &(descT2), m, k,
+                                            ib, smallnb,
+                                            0, 0, ib, tempkn );
+
+        small_descA1->mat = A1;
+        small_descA2->mat = A2;
+        small_descT->mat  = T;
+
+        /* dague_object */
+        dague_ztsqrt = dplasma_zgeqrfr_tsqrt_New((tiled_matrix_desc_t *)small_descA1,
+                                                 (tiled_matrix_desc_t *)small_descA2,
+                                                 (tiled_matrix_desc_t *)small_descT,
+                                                 p_work, p_tau );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_ztsqrt, dplasma_zgeqrfr_tsqrt_Destruct,
+                             3, small_descA1, small_descA2, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m - m * descA2.mb) : descA2.mb;
+    int tempkn = (k == (descA2.nt-1)) ? (descA2.n - k * descA2.nb) : descA2.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA2, m );
+
+#if !defined(DAGUE_DRY_RUN)
+
+    void *p_elem_A = dague_private_memory_pop( p_tau );
+    void *p_elem_B = dague_private_memory_pop( p_work );
+
+    CORE_ztsqrt(tempmm, tempkn, ib,
+                A1 /* dataA1(k,k) */, ldak,
+                A2 /* dataA2(m,k) */, ldam,
+                T  /* dataT2(m,k) */, descT2.mb,
+                p_elem_A, p_elem_B );
+
+    dague_private_memory_push( p_tau,  p_elem_A );
+    dague_private_memory_push( p_work, p_elem_B );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+
+geqrf1_ztsmqr_out_A1(k, n) [profile = off]
+  k = 0   .. KT-1
+  n = k+1 .. descA1.nt-1
+  mmax = inline_c %{ return optid ? k : descA2.mt-1; %}
+
+  : dataA1(k, n)
+
+  RW A1 <- A1 geqrf2_ztsmqr(k, mmax, n)
+        -> dataA1(k, n)
+BODY
+{
+    /* nothing */
+}
+END
+
+
+/**************************************************
+ *                    geqrf_ztsmqr                      *
+ **************************************************/
+geqrf1_ztsmqr(k,m,n)
+  /* Execution space */
+  k = 0   .. inline_c %{ return optqr ? -1 : KT-1; %}
+  m = k+1 .. descA1.mt-1
+  n = k+1 .. descA1.nt-1
+
+  : dataA1(m, n)
+
+  RW   A1 <- ( m == (k+1)) ? C  geqrf1_zunmqr(k, n)
+          <- ( m != (k+1)) ? A1 geqrf1_ztsmqr(k, m-1, n)
+          -> ( m == (descA1.mt-1)) ? A1 geqrf2_ztsmqr(k, 0,   n)
+          -> ( m != (descA1.mt-1)) ? A1 geqrf1_ztsmqr(k, m+1, n)
+
+  RW   A2 <- (k == 0) ? A  A1_in(m, n)
+          <- (k != 0) ? A2 geqrf1_ztsmqr(k-1, m, n)
+
+          -> (((k+1) == n) & ((k+1) == m)) ? A  geqrf1_zgeqrt(n)            /* Diagonal */
+          -> (((k+1) == m) & (    n > m )) ? C  geqrf1_zunmqr(k+1, n)       /* Next row */
+          -> (((k+1) == n) & (    m > n )) ? A2 geqrf1_ztsqrt(n, m)         /* Next column */
+          -> (((k+1) <  n) & ((1+k) < m )) ? A2 geqrf1_ztsmqr(k+1, m, n)    /* trailing submatrix */
+
+  READ V  <- A2 geqrf1_ztsqrt(k, m)
+  READ T  <- T  geqrf1_ztsqrt(k, m)   [type = LITTLE_T]
+
+    /* Priority */
+; (descA1.mt-k)*(descA1.mt-n)*(descA1.mt-n)
+
+BODY [type=CUDA device=inline_c %{ return n; %}]
+{
+    dague_complex64_t *WORK, *WORKC;
+    int tempmm = (m == (descA1.mt-1)) ? (descA1.m - m * descA1.mb) : descA1.mb;
+    int tempnn = (n == (descA1.nt-1)) ? (descA1.n - n * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA1, m );
+
+    WORK  = dague_gpu_pop_workspace(gpu_device, gpu_stream, descA1.nb * ib * sizeof(dague_complex64_t));
+    WORKC = dague_gpu_pop_workspace(gpu_device, gpu_stream, descA1.mb * ib * sizeof(dague_complex64_t));
+
+    dplasma_cuda_ztsmqr( PlasmaLeft, PlasmaConjTrans,
+                         descA1.mb, tempnn, tempmm, tempnn, descA1.nb, ib,
+                         A1 /* dataA1(k,n) */, ldak,
+                         A2 /* dataA1(m,n) */, ldam,
+                         V  /* dataA1(m,k) */, ldam,
+                         T  /* dataT1(m,k) */, descT1.mb,
+                         WORK,  ib,
+                         WORKC, descA1.mb,
+                         dague_body.stream );
+}
+END
+
+BODY [type=RECURSIVE]
+{
+    int tempmm = (m == (descA1.mt-1)) ? (descA1.m - m * descA1.mb) : descA1.mb;
+    int tempnn = (n == (descA1.nt-1)) ? (descA1.n - n * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA1, m );
+
+    if (tempmm > smallnb) {
+        subtile_desc_t *small_descA1;
+        subtile_desc_t *small_descA2;
+        subtile_desc_t *small_descV;
+        subtile_desc_t *small_descT;
+        dague_handle_t *dague_ztsmqr;
+
+        small_descA1 = subtile_desc_create( &(descA1), k, n,
+                                            dague_imin(descA1.mb, ldak), smallnb,
+                                            0, 0, descA1.mb, tempnn );
+        small_descA2 = subtile_desc_create( &(descA1), m, n,
+                                            dague_imin(descA1.mb, ldam), smallnb,
+                                            0, 0, tempmm, tempnn );
+        small_descV  = subtile_desc_create( &(descA1), m, k,
+                                            dague_imin(descA1.mb, ldam), smallnb,
+                                            0, 0, tempmm, descA1.nb );
+        small_descT  = subtile_desc_create( &(descT1), m, k,
+                                            ib, smallnb,
+                                            0, 0, ib, descA1.nb );
+
+        small_descA1->mat = A1;
+        small_descA2->mat = A2;
+        small_descV->mat  = V;
+        small_descT->mat  = T;
+
+        /* dague_object */
+        dague_ztsmqr = dplasma_zgeqrfr_tsmqr_New( (tiled_matrix_desc_t *)small_descA1,
+                                                  (tiled_matrix_desc_t *)small_descA2,
+                                                  (tiled_matrix_desc_t *)small_descV,
+                                                  (tiled_matrix_desc_t *)small_descT,
+                                                  p_work );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_ztsmqr, dplasma_zgeqrfr_tsmqr_Destruct,
+                             4, small_descA1, small_descA2, small_descV, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempmm = (m == (descA1.mt-1)) ? (descA1.m - m * descA1.mb) : descA1.mb;
+    int tempnn = (n == (descA1.nt-1)) ? (descA1.n - n * descA1.nb) : descA1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA1, m );
+    int ldwork = ib;
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_ztsmqr(PlasmaLeft, PlasmaConjTrans,
+                descA1.mb, tempnn, tempmm, tempnn, descA1.nb, ib,
+                A1 /* dataA1(k,n) */, ldak,
+                A2 /* dataA1(m,n) */, ldam,
+                V  /* dataA1(m,k) */, ldam,
+                T  /* dataT1(m,k) */, descT1.mb,
+                p_elem_A, ldwork );
+
+    dague_private_memory_push( p_work, p_elem_A );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+geqrf2_ztsmqr(k, m, n)
+  /* Execution space */
+  k = 0     .. KT-1
+  mmax = inline_c %{ return optid ? k : descA2.mt-1; %}
+  m = 0     .. mmax
+  n = (k+1) .. (descA1.nt-1)
+
+  : dataA2(m, n)
+
+  RW   A1 <- ( m == 0 ) & ( optqr) ? A A1_in(k, n)
+          <- ( m == 0 ) & (!optqr) ? A1 geqrf1_ztsmqr(k, descA1.mt-1, n)
+          <- ( m != 0 )            ? A1 geqrf2_ztsmqr(k, m-1,         n)
+          -> ( m == mmax ) ? A1 geqrf1_ztsmqr_out_A1(k, n) : A1 geqrf2_ztsmqr(k, m+1, n)
+
+  RW   A2 <- (!optid & (k == 0)) || (optid & (k == m)) ? A A2_in(m, n)
+          <- A2 geqrf2_ztsmqr(k-1, m, n)
+
+          -> ((k+1) == n) ? A2 geqrf2_ztsqrt(k+1, m)       /* Next column */
+          -> ((k+1) <  n) ? A2 geqrf2_ztsmqr(k+1, m, n)    /* trailing submatrix */
+
+  READ V  <- A2 geqrf2_ztsqrt(k, m)
+  READ T  <- T  geqrf2_ztsqrt(k, m)   [type = LITTLE_T]
+
+    /* Priority */
+; (descA1.mt-k)*(descA1.mt-n)*(descA1.mt-n)
+
+BODY [type=CUDA device=inline_c %{ return n; %}]
+{
+    dague_complex64_t *WORK, *WORKC;
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m- m * descA2.mb) : descA2.mb;
+    int tempnn = (n == (descA2.nt-1)) ? (descA2.n- n * descA2.nb) : descA2.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA2, m );
+
+    WORK  = dague_gpu_pop_workspace(gpu_device, gpu_stream, descA2.nb * ib * sizeof(dague_complex64_t));
+    WORKC = dague_gpu_pop_workspace(gpu_device, gpu_stream, descA2.mb * ib * sizeof(dague_complex64_t));
+
+    dplasma_cuda_ztsmqr( PlasmaLeft, PlasmaConjTrans,
+                         descA1.mb, tempnn, tempmm, tempnn, descA2.nb, ib,
+                         A1 /* dataA1(k,n) */, ldak,
+                         A2 /* dataA2(m,n) */, ldam,
+                         V  /* dataA2(m,k) */, ldam,
+                         T  /* dataT2(m,k) */, descT2.mb,
+                         WORK,  ib,
+                         WORKC, descA2.mb,
+                         dague_body.stream );
+}
+END
+
+BODY [type=RECURSIVE]
+{
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m- m * descA2.mb) : descA2.mb;
+    int tempnn = (n == (descA2.nt-1)) ? (descA2.n- n * descA2.nb) : descA2.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA2, m );
+
+    if (tempmm > smallnb) {
+        subtile_desc_t *small_descA1;
+        subtile_desc_t *small_descA2;
+        subtile_desc_t *small_descV;
+        subtile_desc_t *small_descT;
+        dague_handle_t *dague_ztsmqr;
+
+
+        small_descA1 = subtile_desc_create( &(descA1), k, n,
+                                            dague_imin(descA1.mb, ldak), smallnb,
+                                            0, 0, descA1.mb, tempnn );
+        small_descA2 = subtile_desc_create( &(descA2), m, n,
+                                            dague_imin(descA2.mb, ldam), smallnb,
+                                            0, 0, tempmm, tempnn );
+        small_descV  = subtile_desc_create( &(descA2), m, k,
+                                            dague_imin(descA2.mb, ldam), smallnb,
+                                            0, 0, tempmm, descA2.nb );
+        small_descT  = subtile_desc_create( &(descT2), m, k,
+                                            ib, smallnb,
+                                            0, 0, ib, descA2.nb );
+
+        small_descA1->mat = A1;
+        small_descA2->mat = A2;
+        small_descV->mat  = V;
+        small_descT->mat  = T;
+
+        /* dague_object */
+        dague_ztsmqr = dplasma_zgeqrfr_tsmqr_New( (tiled_matrix_desc_t *)small_descA1,
+                                                  (tiled_matrix_desc_t *)small_descA2,
+                                                  (tiled_matrix_desc_t *)small_descV,
+                                                  (tiled_matrix_desc_t *)small_descT,
+                                                  p_work );
+
+        /* recursive call */
+        dague_recursivecall( context, (dague_execution_context_t*)this_task,
+                             dague_ztsmqr, dplasma_zgeqrfr_tsmqr_Destruct,
+                             4, small_descA1, small_descA2, small_descV, small_descT );
+
+        return DAGUE_HOOK_RETURN_ASYNC;
+    }
+    else
+        return DAGUE_HOOK_RETURN_NEXT;
+}
+END
+
+BODY
+{
+    int tempmm = (m == (descA2.mt-1)) ? (descA2.m - m * descA2.mb) : descA2.mb;
+    int tempnn = (n == (descA2.nt-1)) ? (descA2.n - n * descA2.nb) : descA2.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldam = BLKLDD( descA2, m );
+    int ldwork = ib;
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_ztsmqr(PlasmaLeft, PlasmaConjTrans,
+                descA1.mb, tempnn, tempmm, tempnn, descA1.nb, ib,
+                A1 /* dataA1(k,n) */, ldak,
+                A2 /* dataA2(m,n) */, ldam,
+                V  /* dataA2(m,k) */, ldam,
+                T  /* dataT2(m,k) */, descT2.mb,
+                p_elem_A, ldwork );
+
+    dague_private_memory_push( p_work, p_elem_A );
+
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+
+
+
+
+ungqr1_zlaset(m, n) [profile = off]
+  /* Execution Space */
+  m  = 0 .. descQ1.mt-1
+  n  = 0 .. descQ1.nt-1
+  k    = inline_c %{ return dague_imin(KT,dague_imin(m, n)); %}
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  cq   = inline_c %{ return 0; /*((descQ1.mt == descA1.nt) & (m == (descQ1.mt-1)) & (n == (descQ1.mt-1)));*/ %}
+
+  /* Locality */
+  : dataQ1(m,n)
+
+  RW    A    <- dataQ1(m,n)
+  //             ->  cq ? C ungqr1_zunmqr(k, n)
+             -> (!cq & ((m <= KT) & (n >= m))) ? A1 ungqr2_ztsmqr(k, mmax, n)
+             -> (!cq & ((m >  KT) | (n <  m))) ? A2 ungqr1_ztsmqr(k, m,    n)
+
+BODY
+{
+    int tempmm = (m == (descQ1.mt-1)) ? (descQ1.m - m * descQ1.mb) : descQ1.mb;
+    int tempnn = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldqm = BLKLDD( descQ1, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    CORE_zlaset(PlasmaUpperLower, tempmm, tempnn,
+                0., (m == n) ? 1.: 0.,
+                A /* dataQ(m,n) */, ldqm );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+/**
+ * The Q2 matrix is a zero matrix below the identity so we keep only a subset of
+ * the case from the classic ungqr
+ */
+ungqr2_zlaset(m, n) [profile = off]
+  /* Execution Space */
+  m  = 0 .. descQ2.mt-1
+  n  = 0 .. descQ2.nt-1
+  k    = inline_c %{ return dague_imin(KT, n); %}
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+
+  /* Locality */
+  : dataQ2(m,n)
+
+  RW    A    <- dataQ2(m,n)
+             -> (m <= mmax ) ? A2 ungqr2_ztsmqr(k, m, n)
+
+BODY
+{
+    int tempmm = (m == (descQ2.mt-1)) ? (descQ2.m - m * descQ2.mb) : descQ2.mb;
+    int tempnn = (n == (descQ2.nt-1)) ? (descQ2.n - n * descQ2.nb) : descQ2.nb;
+    int ldqm = BLKLDD( descQ2, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    CORE_zlaset(PlasmaUpperLower, tempmm, tempnn,
+                      0., 0.,
+                      A /* dataQ2(m,n) */, ldqm );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr1_zunmqr(k, n)
+  /* Execution Space */
+  k = 0 .. KT
+  n = k .. descQ1.nt-1
+
+  /* Locality */
+  : dataQ1(k, n)
+
+  READ  A    <- ( optqr) ? A A1_in_typechange(k)           [type = LOWER_TILE]
+             <- (!optqr) ? A geqrf1_zgeqrt_typechange(k)   [type = LOWER_TILE]
+
+  READ  T    <- ( optqr) ? T A1_in(k, k)                   [type = LITTLE_T]
+             <- (!optqr) ? T geqrf1_zgeqrt(k)              [type = LITTLE_T]
+
+  RW    C    <- ( k == (descQ1.mt-1)) ? A1 ungqr2_ztsmqr(k, 0,   n)
+             <- ( k <  (descQ1.mt-1)) ? A1 ungqr1_ztsmqr(k, k+1, n)
+             -> ( k == 0 ) ? dataQ1(k, n)
+             -> ( k >  0 ) ? A2 ungqr1_ztsmqr(k-1, k, n)
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempkm   = (k == (descQ1.mt-1)) ? (descQ1.m - k * descQ1.mb) : descQ1.mb;
+    int tempnn   = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldqk = BLKLDD( descQ1, k );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_zunmqr(PlasmaLeft, PlasmaNoTrans,
+                tempkm, tempnn, tempkmin, ib,
+                A /* dataA1(k, k) */, ldak,
+                T /* dataT1(k, k) */, descT1.mb,
+                C /* dataQ1(k, n) */, ldqk,
+                p_elem_A, descT1.nb );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr1_ztsmqr(k, m, n)
+  /* Execution Space */
+  k = 0     .. KT
+  m = (k+1) .. (descQ1.mt-1)
+  n = k     .. (descQ1.nt-1)
+
+  /* Locality */
+  : dataQ1(m,n)
+
+  RW    A1   <- ( m == (descQ1.mt-1) ) ? A1 ungqr2_ztsmqr(k, 0,   n)
+             <- ( m <  (descQ1.mt-1) ) ? A1 ungqr1_ztsmqr(k, m+1, n)
+             -> ( m == (k+1) ) ? C  ungqr1_zunmqr(k, n)
+             -> ( m >  (k+1) ) ? A1 ungqr1_ztsmqr(k, m-1, n)
+
+  RW    A2   <- ((k == KT) | (n == k)) ? A ungqr1_zlaset(m, n)
+             <- ((k <  KT) & (n >  k) & (m == (k+1))) ? C  ungqr1_zunmqr(k+1, n)
+             <- ((k <  KT) & (n >  k) & (m >  (k+1))) ? A2 ungqr1_ztsmqr(k+1, m, n)
+             -> ( k == 0 ) ? dataQ1(m, n)
+             -> ( k >  0 ) ? A2 ungqr1_ztsmqr(k-1, m, n)
+
+  READ  V    <- ( optqr) ? A A1_in(m, k)
+             <- (!optqr) ? A2 geqrf1_ztsqrt(k, m)
+
+  READ  T    <- ( optqr) ? T A1_in(m, k)                   [type = LITTLE_T]
+             <- (!optqr) ? T geqrf1_ztsqrt(k, m)           [type = LITTLE_T]
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempmm   = (m == (descQ1.mt-1)) ? (descQ1.m - m * descQ1.mb) : descQ1.mb;
+    int tempnn   = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldam = BLKLDD( descA1, m );
+    int ldqk = BLKLDD( descQ1, k );
+    int ldqm = BLKLDD( descQ1, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_ztsmqr(PlasmaLeft, PlasmaNoTrans,
+                descQ1.mb, tempnn, tempmm, tempnn, tempkmin, ib,
+                A1 /* dataQ1(k, n) */, ldqk,
+                A2 /* dataQ1(m, n) */, ldqm,
+                V  /* dataA1(m, k) */, ldam,
+                T  /* dataT1(m, k) */, descT1.mb,
+                p_elem_A, ib );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr2_ztsmqr(k, m, n)
+  /* Execution Space */
+  k = 0 .. KT
+  /* m = (k+1) .. (descQ2.mt-1) */
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  m = 0 .. mmax
+  n = k .. (descQ2.nt-1)
+
+  /* Locality */
+  : dataQ2(m,n)
+
+  RW    A1   <- ( m == mmax ) ? A  ungqr1_zlaset(k, n)
+             <- ( m <  mmax ) ? A1 ungqr2_ztsmqr(k, m+1,         n)
+             -> ( m == 0 ) & (k == descQ1.mt-1) ? C  ungqr1_zunmqr(k, n)
+             -> ( m == 0 ) & (k <  descQ1.mt-1) ? A1 ungqr1_ztsmqr(k, descQ1.mt-1, n)
+             -> ( m >  0 )    ? A1 ungqr2_ztsmqr(k, m-1,         n)
+
+  RW    A2   <- ((k == KT) | (n == k)) ? A  ungqr2_zlaset(m, n)
+             <- ((k <  KT) & (n >  k)) ? A2 ungqr2_ztsmqr(k+1, m, n)
+             -> ( k == 0 ) ? dataQ2(m, n)
+             -> ( k >  0 ) ? A2 ungqr2_ztsmqr(k-1, m, n)
+
+  READ  V    <- A2 geqrf2_ztsqrt(k, m)
+  READ  T    <- T  geqrf2_ztsqrt(k, m)  [type = LITTLE_T]
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempmm   = (m == (descQ2.mt-1)) ? (descQ2.m - m * descQ2.mb) : descQ2.mb;
+    int tempnn   = (n == (descQ2.nt-1)) ? (descQ2.n - n * descQ2.nb) : descQ2.nb;
+    int ldam = BLKLDD( descA2, m );
+    int ldqk = BLKLDD( descQ1, k );
+    int ldqm = BLKLDD( descQ2, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_ztsmqr(PlasmaLeft, PlasmaNoTrans,
+                descQ1.mb, tempnn, tempmm, tempnn, tempkmin, ib,
+                A1 /* dataQ1(k, n) */, ldqk,
+                A2 /* dataQ2(m, n) */, ldqm,
+                V  /* dataA2(m, k) */, ldam,
+                T  /* dataT2(m, k) */, descT2.mb,
+                p_elem_A, ib );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END

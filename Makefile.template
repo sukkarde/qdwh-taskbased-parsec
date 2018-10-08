@@ -1,0 +1,100 @@
+#
+#  Make sure Hwloc, parsec and dplasma are correctly installed and that "pkg-config --libs hwloc parsec dplasma" works
+#
+# PaRSEC must be configured with:
+#      cmake srcdir -DCMAKE_INSTALL_PREFIX=/path/where/to/install -DDAGUE_DEVEL_WITH_HEADERS=ON -DDAGUE_GPU_WITH_CUDA=[OFF|ON] -DDAGUE_DIST_WITH_MPI=ON
+#  followed by make install
+#
+
+CFLAGS=-Wall -g3 -O0
+LDFLAGS=
+
+DAGUEPP=daguepp
+PARSEC_CFLAGS = `pkg-config --cflags dplasma`
+PARSEC_LIBS   = `pkg-config --libs dplasma` -ldplasma_cores -ldplasma_cores_cuda -lcublas -lcudart
+# If DPLASMA compiled with CUDA, comment otherwise
+PARSEC_LIBS  := ${PARSEC_LIBS} -ldplasma_cores_cuda -lcublas -lcudart
+
+MPICC  = mpicc
+MPIF90 = mpif90
+
+#
+# Don't touch after this line
+#
+CFLAGS:= ${CFLAGS} ${PARSEC_CFLAGS} -I../include -I./
+LIBS   = ${LDFLAGS} ${PARSEC_LIBS}
+
+OBJ = main_polar.o 	\
+	qdwh.o		\
+	common.o 	\
+	dgeqrf_id.o 	\
+	dgeqrf_id_wrapper.o	\
+	dorgqr_split.o	\
+	dorgqr_split_wrapper.o	\
+	dgeqrf_split.o	\
+	dgeqrf_split_wrapper.o	\
+	dgeqrf_full.o	\
+	dgeqrf_full_wrapper.o \
+        dlaset_sigma_wrapper.o
+
+TARGETS = main_polar
+
+.SECONDARY: dgeqrf_id.c 	\
+	dgeqrf_id_wrapper.c	\
+	dorgqr_split.c	\
+	dorgqr_split_wrapper.c	\
+	dgeqrf_split.c	\
+	dgeqrf_split_wrapper.c	\
+	dgeqrf_full.c	\
+	dgeqrf_full_wrapper.c \
+        dlaset_sigma_wrapper.c 
+
+all: $(TARGETS)
+
+dgeqrf.h: zgeqrf.h
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_id.jdf: zgeqrf_id.jdf
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_id_wrapper.c: zgeqrf_id_wrapper.c
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dlaset_sigma_wrapper.c: zlaset_sigma_wrapper.c
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_split.jdf: zgeqrf_split.jdf
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_split_wrapper.c: zgeqrf_split_wrapper.c
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_full.jdf: zgeqrf_full.jdf
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_full_wrapper.c: zgeqrf_full_wrapper.c
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dorgqr_split.jdf: zungqr_split.jdf
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dorgqr_split_wrapper.c: zungqr_split_wrapper.c
+	/usr/bin/python precision_tools/codegen.py -f $< -p d 
+
+dgeqrf_id_wrapper.o: dgeqrf.h
+dgeqrf_split_wrapper.o: dgeqrf.h
+dorgqr_split_wrapper.o: dgeqrf.h
+qdwh.o: dgeqrf.h
+
+%.c: %.jdf
+	${DAGUEPP} -i $< -o `basename $@ .c` ${DAGUEPPFLAGS} -- ${CFLAGS}
+#	${CC} -o $@ -c `basename $@ .o` ${CFLAGS}
+
+main_polar: ${OBJ}
+	$(MPIF90) -o $@ $^ ${CFLAGS} $(LIBS)
+
+clean:
+	rm -f *.o dgeqrf* dorgqr*
+
+cleanall: clean
+	rm -f *~ $(TARGETS)

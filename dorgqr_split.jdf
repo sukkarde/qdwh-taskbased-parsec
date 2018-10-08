@@ -1,0 +1,352 @@
+extern "C" %{
+/*
+ * Copyright (c) 2010-2016 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation. All rights
+ *                         reserved.
+ * Copyright (c) 2013-2016 Inria. All rights reserved.
+ * $COPYRIGHT
+ *
+ *
+ * @generated d Sat Aug 13 16:38:53 2016
+ *
+ */
+#include <data_dist/matrix/matrix.h>
+#include <dague/private_mempool.h>
+#include <lapacke.h>
+#include <core_blas.h>
+
+#if defined(DAGUE_HAVE_RECURSIVE)
+#include <data_dist/matrix/subtile.h>
+#include <dague/recursive.h>
+#endif
+
+#if defined(DAGUE_HAVE_CUDA)
+#include <cores/dplasma_dcores.h>
+#endif  /* defined(DAGUE_HAVE_CUDA) */
+
+%}
+
+dataA1    [type = "dague_ddesc_t *"]
+dataA2    [type = "dague_ddesc_t *"]
+dataT1    [type = "dague_ddesc_t *"]
+dataT2    [type = "dague_ddesc_t *"]
+dataQ1    [type = "dague_ddesc_t *"]
+dataQ2    [type = "dague_ddesc_t *"]
+optid     [type = "int" ]
+p_work    [type = "dague_memory_pool_t *" size = "((sizeof(double))*ib)*descT2.nb"]
+
+descA1    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataA1)"]
+descA2    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataA2)"]
+descT1    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataT1)"]
+descT2    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataT2)"]
+descQ1    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataQ1)"]
+descQ2    [type = "tiled_matrix_desc_t" hidden = on default = "*((tiled_matrix_desc_t*)dataQ2)"]
+ib        [type = "int" hidden = on default = "descT1.mb" ]
+KT        [type = "int" hidden = on default = "descA1.nt-1" ]
+KT2       [type = "int" hidden = on default = "dague_imin( KT, descQ1.mt-2 )" ]
+
+ungqr_dlaset1(m, n) [profile = off]
+  /* Execution Space */
+  m  = 0 .. descQ1.mt-1
+  n  = 0 .. descQ1.nt-1
+  k    = inline_c %{ return dague_imin(KT,dague_imin(m, n)); %}
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  cq   = inline_c %{ return 0; /*((descQ1.mt == descA1.nt) & (m == (descQ1.mt-1)) & (n == (descQ1.mt-1)));*/ %}
+
+  /* Locality */
+  : dataQ1(m,n)
+
+  RW    A    <- dataQ1(m,n)
+  //             ->  cq ? C ungqr_dormqr1(k, n)
+             -> (!cq & ((m <= KT) & (n >= m))) ? A1 ungqr_dtsmqr2(k, mmax, n)
+             -> (!cq & ((m >  KT) | (n <  m))) ? A2 ungqr_dtsmqr1(k, m,    n)
+
+BODY
+{
+    int tempmm = (m == (descQ1.mt-1)) ? (descQ1.m - m * descQ1.mb) : descQ1.mb;
+    int tempnn = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldqm = BLKLDD( descQ1, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    CORE_dlaset(PlasmaUpperLower, tempmm, tempnn,
+                0., (m == n) ? 1.: 0.,
+                A /* dataQ(m,n) */, ldqm );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+/**
+ * The Q2 matrix is a zero matrix below the identity so we keep only a subset of
+ * the case from the classic ungqr
+ */
+ungqr_dlaset2(m, n) [profile = off]
+  /* Execution Space */
+  m  = 0 .. descQ2.mt-1
+  n  = 0 .. descQ2.nt-1
+  k    = inline_c %{ return dague_imin(KT, n); %}
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+
+  /* Locality */
+  : dataQ2(m,n)
+
+  RW    A    <- dataQ2(m,n)
+             -> (m <= mmax ) ? A2 ungqr_dtsmqr2(k, m, n)
+
+BODY
+{
+    int tempmm = (m == (descQ2.mt-1)) ? (descQ2.m - m * descQ2.mb) : descQ2.mb;
+    int tempnn = (n == (descQ2.nt-1)) ? (descQ2.n - n * descQ2.nb) : descQ2.nb;
+    int ldqm = BLKLDD( descQ2, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    CORE_dlaset(PlasmaUpperLower, tempmm, tempnn,
+                      0., 0.,
+                      A /* dataQ2(m,n) */, ldqm );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr_dormqr1(k, n)
+  /* Execution Space */
+  k = 0 .. KT
+  n = k .. descQ1.nt-1
+
+  /* Locality */
+  : dataQ1(k, n)
+
+  READ  A    <- A ungqr_dormqr_in_A1(k)   [type = LOWER_TILE]
+  READ  T    <- T ungqr_dormqr_in_T1(k)   [type = LITTLE_T]
+
+  RW    C    <- ( k == (descQ1.mt-1)) ? A1 ungqr_dtsmqr2(k, 0,   n)
+             <- ( k <  (descQ1.mt-1)) ? A1 ungqr_dtsmqr1(k, k+1, n)
+             -> ( k == 0 ) ? dataQ1(k, n)
+             -> ( k >  0 ) ? A2 ungqr_dtsmqr1(k-1, k, n)
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempkm   = (k == (descQ1.mt-1)) ? (descQ1.m - k * descQ1.mb) : descQ1.mb;
+    int tempnn   = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldak = BLKLDD( descA1, k );
+    int ldqk = BLKLDD( descQ1, k );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_dormqr(PlasmaLeft, PlasmaNoTrans,
+                tempkm, tempnn, tempkmin, ib,
+                A /* dataA1(k, k) */, ldak,
+                T /* dataT1(k, k) */, descT1.mb,
+                C /* dataQ1(k, n) */, ldqk,
+                p_elem_A, descT1.nb );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr_dormqr_in_T1(k) [profile = off]
+  /* Execution Space */
+  k = 0 .. KT
+
+  /* Locality */
+  : dataT1(k,k)
+
+  READ  T    <- dataT1(k,k)                             [type = LITTLE_T]
+             -> T ungqr_dormqr1(k, k .. descQ1.nt-1)    [type = LITTLE_T]
+
+BODY
+{
+    /* nothing */
+}
+END
+
+ungqr_dormqr_in_A1(k) [profile = off]
+  /* Execution Space */
+  k = 0 .. KT
+
+  /* Locality */
+  : dataA1(k,k)
+
+  READ  A    <- dataA1(k,k)                           [type = LOWER_TILE]
+             -> A ungqr_dormqr1(k, k .. descQ1.nt-1)   [type = LOWER_TILE]
+
+BODY
+{
+    /* nothing */
+}
+END
+
+ungqr_dtsmqr1(k, m, n)
+  /* Execution Space */
+  k = 0     .. KT
+  m = (k+1) .. (descQ1.mt-1)
+  n = k     .. (descQ1.nt-1)
+
+  /* Locality */
+  : dataQ1(m,n)
+
+  RW    A1   <- ( m == (descQ1.mt-1) ) ? A1 ungqr_dtsmqr2(k, 0,   n)
+             <- ( m <  (descQ1.mt-1) ) ? A1 ungqr_dtsmqr1(k, m+1, n)
+             -> ( m == (k+1) ) ? C  ungqr_dormqr1(k, n)
+             -> ( m >  (k+1) ) ? A1 ungqr_dtsmqr1(k, m-1, n)
+
+  RW    A2   <- ((k == KT) | (n == k)) ? A ungqr_dlaset1(m, n)
+             <- ((k <  KT) & (n >  k) & (m == (k+1))) ? C  ungqr_dormqr1(k+1, n)
+             <- ((k <  KT) & (n >  k) & (m >  (k+1))) ? A2 ungqr_dtsmqr1(k+1, m, n)
+             -> ( k == 0 ) ? dataQ1(m, n)
+             -> ( k >  0 ) ? A2 ungqr_dtsmqr1(k-1, m, n)
+
+  READ  V    <- V ungqr_dtsmqr_in_A1(k, m)
+  READ  T    <- T ungqr_dtsmqr_in_T1(k, m)  [type = LITTLE_T]
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempmm   = (m == (descQ1.mt-1)) ? (descQ1.m - m * descQ1.mb) : descQ1.mb;
+    int tempnn   = (n == (descQ1.nt-1)) ? (descQ1.n - n * descQ1.nb) : descQ1.nb;
+    int ldam = BLKLDD( descA1, m );
+    int ldqk = BLKLDD( descQ1, k );
+    int ldqm = BLKLDD( descQ1, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_dtsmqr(PlasmaLeft, PlasmaNoTrans,
+                descQ1.mb, tempnn, tempmm, tempnn, tempkmin, ib,
+                A1 /* dataQ1(k, n) */, ldqk,
+                A2 /* dataQ1(m, n) */, ldqm,
+                V  /* dataA1(m, k) */, ldam,
+                T  /* dataT1(m, k) */, descT1.mb,
+                p_elem_A, ib );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr_dtsmqr_in_T1(k, m) [profile = off]
+  /* Execution Space */
+  k = 0     .. KT2
+  m = (k+1) .. (descQ1.mt-1)
+
+  /* Locality */
+  : dataT1(m, k)
+
+  READ  T    <- dataT1(m, k)                              [type = LITTLE_T]
+             -> T ungqr_dtsmqr1(k, m, k .. (descQ1.nt-1)) [type = LITTLE_T]
+
+BODY
+{
+    /* nothing */
+}
+END
+
+ungqr_dtsmqr_in_A1(k, m) [profile = off]
+  /* Execution Space */
+  k = 0     .. KT2
+  m = (k+1) .. (descQ1.mt-1)
+
+  /* Locality */
+  : dataA1(m, k)
+
+  READ  V    <- dataA1(m, k)
+             -> V ungqr_dtsmqr1(k, m, k .. (descQ1.nt-1))
+
+BODY
+{
+    /* nothing */
+}
+END
+
+ungqr_dtsmqr2(k, m, n)
+  /* Execution Space */
+  k = 0 .. KT
+  /* m = (k+1) .. (descQ2.mt-1) */
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  m = 0 .. mmax
+  n = k .. (descQ2.nt-1)
+
+  /* Locality */
+  : dataQ2(m,n)
+
+  RW    A1   <- ( m == mmax ) ? A  ungqr_dlaset1(k, n)
+             <- ( m <  mmax ) ? A1 ungqr_dtsmqr2(k, m+1,         n)
+             -> ( m == 0 ) & (k == descQ1.mt-1) ? C  ungqr_dormqr1(k, n)
+             -> ( m == 0 ) & (k <  descQ1.mt-1) ? A1 ungqr_dtsmqr1(k, descQ1.mt-1, n)
+             -> ( m >  0 )    ? A1 ungqr_dtsmqr2(k, m-1,         n)
+
+  RW    A2   <- ((k == KT) | (n == k)) ? A  ungqr_dlaset2(m, n)
+             <- ((k <  KT) & (n >  k)) ? A2 ungqr_dtsmqr2(k+1, m, n)
+             -> ( k == 0 ) ? dataQ2(m, n)
+             -> ( k >  0 ) ? A2 ungqr_dtsmqr2(k-1, m, n)
+
+  READ  V    <- V ungqr_dtsmqr2_in_A2(k, m)
+  READ  T    <- T ungqr_dtsmqr2_in_T2(k, m)  [type = LITTLE_T]
+
+BODY
+{
+    int tempAkm  = (k == (descA1.mt-1)) ? (descA1.m - k * descA1.mb) : descA1.mb;
+    int tempAkn  = (k == (descA1.nt-1)) ? (descA1.n - k * descA1.nb) : descA1.nb;
+    int tempkmin = dague_imin( tempAkm, tempAkn );
+    int tempmm   = (m == (descQ2.mt-1)) ? (descQ2.m - m * descQ2.mb) : descQ2.mb;
+    int tempnn   = (n == (descQ2.nt-1)) ? (descQ2.n - n * descQ2.nb) : descQ2.nb;
+    int ldam = BLKLDD( descA2, m );
+    int ldqk = BLKLDD( descQ1, k );
+    int ldqm = BLKLDD( descQ2, m );
+
+#if !defined(DAGUE_DRY_RUN)
+    void *p_elem_A = dague_private_memory_pop( p_work );
+
+    CORE_dtsmqr(PlasmaLeft, PlasmaNoTrans,
+                descQ1.mb, tempnn, tempmm, tempnn, tempkmin, ib,
+                A1 /* dataQ1(k, n) */, ldqk,
+                A2 /* dataQ2(m, n) */, ldqm,
+                V  /* dataA2(m, k) */, ldam,
+                T  /* dataT2(m, k) */, descT2.mb,
+                p_elem_A, ib );
+
+    dague_private_memory_push( p_work, p_elem_A );
+#endif  /* !defined(DAGUE_DRY_RUN) */
+}
+END
+
+ungqr_dtsmqr2_in_T2(k, m) [profile = off]
+  /* Execution Space */
+  k = 0 .. KT
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  m = 0 .. mmax
+
+  /* Locality */
+  : dataT2(m, k)
+
+  READ  T    <- dataT2(m, k)                               [type = LITTLE_T]
+             -> T ungqr_dtsmqr2(k, m, k .. (descQ2.nt-1))  [type = LITTLE_T]
+
+BODY
+{
+    /* nothing */
+}
+END
+
+ungqr_dtsmqr2_in_A2(k, m) [profile = off]
+  /* Execution Space */
+  k = 0 .. KT
+  mmax = inline_c %{ return optid ? k : descQ2.mt-1; %}
+  m = 0 .. mmax
+
+  /* Locality */
+  : dataA2(m, k)
+
+  READ  V    <- dataA2(m, k)
+             -> V ungqr_dtsmqr2(k, m, k .. (descQ2.nt-1))
+
+BODY
+{
+    /* nothing */
+}
+END
